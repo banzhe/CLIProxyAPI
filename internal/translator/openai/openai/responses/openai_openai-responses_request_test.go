@@ -125,29 +125,27 @@ func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_DefersMessageUntil
 	}
 }
 
-func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_UnwrapsStringifiedToolOutputImages(t *testing.T) {
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_RelaysStringifiedToolOutputImages(t *testing.T) {
 	tests := []struct {
-		name         string
-		output       string
-		imageIndex   int
-		expectedURL  string
-		expectedText string
-		detail       string
+		name                string
+		output              string
+		expectedToolContent string
+		expectedURL         string
+		expectedDetail      string
 	}{
 		{
-			name:         "Codex input image",
-			output:       `[{"type":"input_text","text":"Captured screenshot."},{"detail":"original","image_url":"data:image/png;base64,AA==","type":"input_image"}]`,
-			imageIndex:   1,
-			expectedURL:  "data:image/png;base64,AA==",
-			expectedText: "Captured screenshot.",
-			detail:       "high",
+			name:                "Codex input image",
+			output:              `[{"type":"input_text","text":"Captured screenshot."},{"detail":"original","image_url":"data:image/png;base64,AA==","type":"input_image"}]`,
+			expectedToolContent: "Captured screenshot.",
+			expectedURL:         "data:image/png;base64,AA==",
+			expectedDetail:      "high",
 		},
 		{
-			name:        "OpenAI image URL",
-			output:      `[{"type":"image_url","image_url":{"url":"https://example.com/generated.png","detail":"high"}}]`,
-			imageIndex:  0,
-			expectedURL: "https://example.com/generated.png",
-			detail:      "high",
+			name:                "OpenAI image URL",
+			output:              `[{"type":"image_url","image_url":{"url":"https://example.com/generated.png","detail":"high"}}]`,
+			expectedToolContent: toolResultImagePlaceholder,
+			expectedURL:         "https://example.com/generated.png",
+			expectedDetail:      "high",
 		},
 	}
 
@@ -161,37 +159,40 @@ func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_UnwrapsStringified
 			}`, tt.output))
 
 			out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("k3", raw, false)
-			content := gjson.GetBytes(out, "messages.1.content")
-			if !content.IsArray() {
-				t.Fatalf("expected tool content array, got %s; output=%s", content.Raw, out)
+			messages := gjson.GetBytes(out, "messages").Array()
+			if len(messages) != 3 {
+				t.Fatalf("expected 3 messages (assistant, tool, user relay), got %d; output=%s", len(messages), out)
 			}
-			parts := content.Array()
-			if len(parts) <= tt.imageIndex {
-				t.Fatalf("expected image part at index %d, got %s", tt.imageIndex, content.Raw)
+			if got := messages[1].Get("role").String(); got != "tool" {
+				t.Fatalf("messages.1.role = %q, want tool; output=%s", got, out)
 			}
-			imagePart := parts[tt.imageIndex]
-			if got := imagePart.Get("type").String(); got != "image_url" {
-				t.Fatalf("image type = %q, want image_url; part=%s", got, imagePart.Raw)
+			if got := messages[1].Get("content").Type; got != gjson.String {
+				t.Fatalf("expected tool content string, got %s; output=%s", got, out)
 			}
-			if got := imagePart.Get("image_url.url").String(); got != tt.expectedURL {
-				t.Fatalf("image URL = %q, want %q; part=%s", got, tt.expectedURL, imagePart.Raw)
+			if got := messages[1].Get("content").String(); got != tt.expectedToolContent {
+				t.Fatalf("tool content = %q, want %q; output=%s", got, tt.expectedToolContent, out)
 			}
-			if got := imagePart.Get("image_url.detail").String(); got != tt.detail {
-				t.Fatalf("image detail = %q, want %q; part=%s", got, tt.detail, imagePart.Raw)
+			relay := messages[2]
+			if got := relay.Get("role").String(); got != "user" {
+				t.Fatalf("relay role = %q, want user; output=%s", got, out)
 			}
-			if tt.expectedText != "" {
-				if got := parts[0].Get("type").String(); got != "text" {
-					t.Fatalf("text type = %q, want text; part=%s", got, parts[0].Raw)
-				}
-				if got := parts[0].Get("text").String(); got != tt.expectedText {
-					t.Fatalf("text = %q, want %q; part=%s", got, tt.expectedText, parts[0].Raw)
-				}
+			if got := relay.Get("content.0.text").String(); got != toolResultImageRelayNotice {
+				t.Fatalf("relay notice = %q, want %q; output=%s", got, toolResultImageRelayNotice, out)
+			}
+			if got := relay.Get("content.1.type").String(); got != "image_url" {
+				t.Fatalf("relay image type = %q, want image_url; output=%s", got, out)
+			}
+			if got := relay.Get("content.1.image_url.url").String(); got != tt.expectedURL {
+				t.Fatalf("relay image URL = %q, want %q; output=%s", got, tt.expectedURL, out)
+			}
+			if got := relay.Get("content.1.image_url.detail").String(); got != tt.expectedDetail {
+				t.Fatalf("relay image detail = %q, want %q; output=%s", got, tt.expectedDetail, out)
 			}
 		})
 	}
 }
 
-func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_UnwrapsStringifiedCustomToolOutputImages(t *testing.T) {
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_RelaysStringifiedCustomToolOutputImages(t *testing.T) {
 	raw := []byte(`{
 		"input": [
 			{"type":"custom_tool_call","call_id":"call_image","name":"view_image","input":"{}"},
@@ -200,18 +201,22 @@ func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_UnwrapsStringified
 	}`)
 
 	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("kimi-k3", raw, false)
-	content := gjson.GetBytes(out, "messages.1.content")
-	if !content.IsArray() {
-		t.Fatalf("expected custom tool content array, got %s; output=%s", content.Raw, out)
+	messages := gjson.GetBytes(out, "messages").Array()
+	if len(messages) != 3 {
+		t.Fatalf("expected 3 messages (assistant, tool, user relay), got %d; output=%s", len(messages), out)
 	}
-	if got := content.Get("0.type").String(); got != "image_url" {
-		t.Fatalf("image type = %q, want image_url; output=%s", got, out)
+	if got := messages[1].Get("content").String(); got != toolResultImagePlaceholder {
+		t.Fatalf("tool content = %q, want placeholder; output=%s", got, out)
 	}
-	if got := content.Get("0.image_url.url").String(); got != "data:image/png;base64,AA==" {
-		t.Fatalf("image URL = %q, want data URL; output=%s", got, out)
+	relay := messages[2]
+	if got := relay.Get("role").String(); got != "user" {
+		t.Fatalf("relay role = %q, want user; output=%s", got, out)
 	}
-	if got := content.Get("0.image_url.detail").String(); got != "high" {
-		t.Fatalf("image detail = %q, want high; output=%s", got, out)
+	if got := relay.Get("content.1.image_url.url").String(); got != "data:image/png;base64,AA==" {
+		t.Fatalf("relay image URL = %q, want data URL; output=%s", got, out)
+	}
+	if got := relay.Get("content.1.image_url.detail").String(); got != "high" {
+		t.Fatalf("relay image detail = %q, want high; output=%s", got, out)
 	}
 }
 
@@ -247,7 +252,7 @@ func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_PreservesCustomToo
 	}
 }
 
-func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_ConvertsStructuredToolOutputImages(t *testing.T) {
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_RelaysStructuredToolOutputImages(t *testing.T) {
 	raw := []byte(`{
 		"input": [
 			{"type":"function_call","call_id":"call_image","name":"view_image","arguments":"{}"},
@@ -263,18 +268,114 @@ func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_ConvertsStructured
 	}`)
 
 	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("k3", raw, false)
-	content := gjson.GetBytes(out, "messages.1.content")
-	if !content.IsArray() {
-		t.Fatalf("expected tool content array, got %s; output=%s", content.Raw, out)
+	messages := gjson.GetBytes(out, "messages").Array()
+	if len(messages) != 3 {
+		t.Fatalf("expected 3 messages (assistant, tool, user relay), got %d; output=%s", len(messages), out)
 	}
-	if got := content.Get("1.type").String(); got != "image_url" {
-		t.Fatalf("image type = %q, want image_url; output=%s", got, out)
+	if got := messages[1].Get("content").String(); got != "Captured screenshot." {
+		t.Fatalf("tool content = %q, want text only; output=%s", got, out)
 	}
-	if got := content.Get("1.image_url.url").String(); got != "data:image/png;base64,AA==" {
-		t.Fatalf("image URL = %q, want data URL; output=%s", got, out)
+	relay := messages[2]
+	if got := relay.Get("role").String(); got != "user" {
+		t.Fatalf("relay role = %q, want user; output=%s", got, out)
 	}
-	if got := content.Get("1.image_url.detail").String(); got != "high" {
-		t.Fatalf("image detail = %q, want high; output=%s", got, out)
+	if got := relay.Get("content.1.image_url.url").String(); got != "data:image/png;base64,AA==" {
+		t.Fatalf("relay image URL = %q, want data URL; output=%s", got, out)
+	}
+	if got := relay.Get("content.1.image_url.detail").String(); got != "high" {
+		t.Fatalf("relay image detail = %q, want high; output=%s", got, out)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_MergesRelayedToolImagesIntoUserMessage(t *testing.T) {
+	tests := []struct {
+		name          string
+		userItem      string
+		userTextQuery string
+	}{
+		{
+			name:          "string content",
+			userItem:      `{"type":"message","role":"user","content":"what changed?"}`,
+			userTextQuery: "content.2.text",
+		},
+		{
+			name:          "array content",
+			userItem:      `{"type":"message","role":"user","content":[{"type":"input_text","text":"what changed?"}]}`,
+			userTextQuery: "content.2.text",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			raw := []byte(fmt.Sprintf(`{
+				"input": [
+					{"type":"function_call","call_id":"call_shot","name":"screenshot","arguments":"{}"},
+					{"type":"function_call_output","call_id":"call_shot","output":"[{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,AA==\"}]"},
+					%s
+				]
+			}`, tt.userItem))
+
+			out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("k3", raw, false)
+			messages := gjson.GetBytes(out, "messages").Array()
+			if len(messages) != 3 {
+				t.Fatalf("expected 3 messages (assistant, tool, user), got %d; output=%s", len(messages), out)
+			}
+			if got := messages[1].Get("content").String(); got != toolResultImagePlaceholder {
+				t.Fatalf("tool content = %q, want placeholder; output=%s", got, out)
+			}
+			user := messages[2]
+			if got := user.Get("role").String(); got != "user" {
+				t.Fatalf("messages.2.role = %q, want user; output=%s", got, out)
+			}
+			if got := user.Get("content.#").Int(); got != 3 {
+				t.Fatalf("user content parts = %d, want 3 (notice, image, text); output=%s", got, out)
+			}
+			if got := user.Get("content.0.text").String(); got != toolResultImageRelayNotice {
+				t.Fatalf("merged notice = %q, want %q; output=%s", got, toolResultImageRelayNotice, out)
+			}
+			if got := user.Get("content.1.image_url.url").String(); got != "data:image/png;base64,AA==" {
+				t.Fatalf("merged image URL = %q, want data URL; output=%s", got, out)
+			}
+			if got := user.Get(tt.userTextQuery).String(); got != "what changed?" {
+				t.Fatalf("user text = %q, want what changed?; output=%s", got, out)
+			}
+		})
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_RelaysImagesAfterToolMessageGroup(t *testing.T) {
+	raw := []byte(`{
+		"input": [
+			{"type":"function_call","call_id":"call_a","name":"shot_a","arguments":"{}"},
+			{"type":"function_call","call_id":"call_b","name":"shot_b","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_a","output":"[{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,AA==\"}]"},
+			{"type":"function_call_output","call_id":"call_b","output":"[{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,BB==\"}]"}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("k3", raw, false)
+	messages := gjson.GetBytes(out, "messages").Array()
+	if len(messages) != 4 {
+		t.Fatalf("expected 4 messages (assistant, tool, tool, user relay), got %d; output=%s", len(messages), out)
+	}
+	if got := messages[1].Get("role").String(); got != "tool" {
+		t.Fatalf("messages.1.role = %q, want tool; output=%s", got, out)
+	}
+	if got := messages[2].Get("role").String(); got != "tool" {
+		t.Fatalf("messages.2.role = %q, want tool; output=%s", got, out)
+	}
+	relay := messages[3]
+	if got := relay.Get("role").String(); got != "user" {
+		t.Fatalf("relay role = %q, want user; output=%s", got, out)
+	}
+	if got := relay.Get("content.0.text").String(); got != toolResultImageRelayNotice {
+		t.Fatalf("relay notice = %q, want %q; output=%s", got, toolResultImageRelayNotice, out)
+	}
+	if got := relay.Get("content.1.image_url.url").String(); got != "data:image/png;base64,AA==" {
+		t.Fatalf("relay image URL = %q, want first image; output=%s", got, out)
+	}
+	if got := relay.Get("content.2.image_url.url").String(); got != "data:image/png;base64,BB==" {
+		t.Fatalf("relay image URL = %q, want second image; output=%s", got, out)
 	}
 }
 
