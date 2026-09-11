@@ -35,7 +35,37 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 	root := gjson.ParseBytes(rawJSON)
 
 	messages := make([][]byte, 0)
+	// OpenAI tool messages cannot carry image parts, so images returned by a
+	// tool output are relayed as a user message following the tool message run.
+	relayedToolImages := make([][]byte, 0)
+	flushRelayImages := func() {
+		if len(relayedToolImages) == 0 {
+			return
+		}
+		relayItems := make([][]byte, 0, len(relayedToolImages)+1)
+		noticeJSON := []byte(`{"type":"text","text":""}`)
+		noticeJSON, _ = sjson.SetBytes(noticeJSON, "text", toolResultImageRelayNotice)
+		relayItems = append(relayItems, noticeJSON)
+		relayItems = append(relayItems, relayedToolImages...)
+		relayJSON := []byte(`{"role":"user"}`)
+		relayJSON, _ = sjson.SetRawBytes(relayJSON, "content", translatorcommon.JoinRawArray(relayItems))
+		messages = append(messages, relayJSON)
+		relayedToolImages = relayedToolImages[:0]
+	}
 	appendMessage := func(message []byte) {
+		switch gjson.GetBytes(message, "role").String() {
+		case "tool":
+			// Tool messages stay adjacent so tool-call responses keep their group.
+		case "user":
+			// Merge relayed images into the following user message so the request
+			// keeps a single user turn.
+			if len(relayedToolImages) > 0 {
+				message = mergeRelayImagesIntoUserMessage(message, relayedToolImages)
+				relayedToolImages = relayedToolImages[:0]
+			}
+		default:
+			flushRelayImages()
+		}
 		messages = append(messages, message)
 	}
 
@@ -271,7 +301,9 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 				}
 
 				if output := item.Get("output"); output.Exists() {
-					toolMessage = setFunctionCallOutputContent(toolMessage, output)
+					var relayedImages [][]byte
+					toolMessage, relayedImages = setFunctionCallOutputContent(toolMessage, output)
+					relayedToolImages = append(relayedToolImages, relayedImages...)
 				}
 
 				appendMessage(toolMessage)
@@ -309,7 +341,9 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 					delete(awaitingToolOutputs, callID)
 				}
 				if output := item.Get("output"); output.Exists() {
-					toolMessage = setCustomToolCallOutputContent(toolMessage, output)
+					var relayedImages [][]byte
+					toolMessage, relayedImages = setCustomToolCallOutputContent(toolMessage, output)
+					relayedToolImages = append(relayedToolImages, relayedImages...)
 				}
 				appendMessage(toolMessage)
 				if len(awaitingToolOutputs) == 0 && len(deferredMessages) > 0 {
@@ -324,6 +358,7 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 		flushPendingToolCalls()
 		appendPendingReasoningMessage()
 		flushDeferredMessages()
+		flushRelayImages()
 	} else if input.Type == gjson.String {
 		msg := []byte(`{}`)
 		msg, _ = sjson.SetBytes(msg, "role", "user")
@@ -386,29 +421,49 @@ func convertResponsesTextFormatToChatResponseFormat(textFormat gjson.Result) []b
 	}
 }
 
-func setFunctionCallOutputContent(toolMessage []byte, output gjson.Result) []byte {
+// toolResultImagePlaceholder keeps the OpenAI tool message non-empty when a
+// Responses tool output carried nothing but images.
+const toolResultImagePlaceholder = "[Tool returned image content; the images follow in the next user message.]"
+
+// toolResultImageRelayNotice labels the user message that carries relayed tool images.
+const toolResultImageRelayNotice = "Images returned by the preceding tool call(s):"
+
+func setFunctionCallOutputContent(toolMessage []byte, output gjson.Result) ([]byte, [][]byte) {
 	structuredContent := output
 	if output.Type == gjson.String {
 		if !gjson.Valid(output.String()) {
 			toolMessage, _ = sjson.SetBytes(toolMessage, "content", output.String())
-			return toolMessage
+			return toolMessage, nil
 		}
 		structuredContent = gjson.Parse(output.String())
 	}
 
 	if hasChatToolOutputImagePart(structuredContent) {
-		contentItems := make([][]byte, 0, len(structuredContent.Array()))
+		textParts := make([]string, 0, len(structuredContent.Array()))
+		images := make([][]byte, 0, len(structuredContent.Array()))
 		for _, item := range structuredContent.Array() {
-			contentItems = append(contentItems, chatToolOutputContentPart(item))
+			switch item.Get("type").String() {
+			case "text", "input_text", "output_text":
+				textParts = append(textParts, item.Get("text").String())
+			case "image_url", "input_image":
+				images = append(images, chatToolOutputContentPart(item))
+			default:
+				textParts = append(textParts, chatToolOutputFallbackText(item))
+			}
 		}
-		return translatorcommon.SetRawArrayItems(toolMessage, "content", contentItems)
+		content := strings.Join(textParts, "\n\n")
+		if strings.TrimSpace(content) == "" {
+			content = toolResultImagePlaceholder
+		}
+		toolMessage, _ = sjson.SetBytes(toolMessage, "content", content)
+		return toolMessage, images
 	}
 
 	toolMessage, _ = sjson.SetBytes(toolMessage, "content", output.String())
-	return toolMessage
+	return toolMessage, nil
 }
 
-func setCustomToolCallOutputContent(toolMessage []byte, output gjson.Result) []byte {
+func setCustomToolCallOutputContent(toolMessage []byte, output gjson.Result) ([]byte, [][]byte) {
 	structuredContent := output
 	if output.Type == gjson.String && gjson.Valid(output.String()) {
 		structuredContent = gjson.Parse(output.String())
@@ -418,7 +473,7 @@ func setCustomToolCallOutputContent(toolMessage []byte, output gjson.Result) []b
 	}
 
 	toolMessage, _ = sjson.SetBytes(toolMessage, "content", responsesToolOutputText(output))
-	return toolMessage
+	return toolMessage, nil
 }
 
 func chatToolOutputContentPart(item gjson.Result) []byte {
@@ -520,13 +575,44 @@ func normalizeChatImageDetail(detailValue gjson.Result) (string, bool) {
 }
 
 func chatToolOutputFallbackPart(item gjson.Result) []byte {
+	part := []byte(`{"type":"text","text":""}`)
+	part, _ = sjson.SetBytes(part, "text", chatToolOutputFallbackText(item))
+	return part
+}
+
+func chatToolOutputFallbackText(item gjson.Result) string {
 	text := item.Raw
 	if item.Type == gjson.String || text == "" {
 		text = item.String()
 	}
-	part := []byte(`{"type":"text","text":""}`)
-	part, _ = sjson.SetBytes(part, "text", text)
-	return part
+	return text
+}
+
+// mergeRelayImagesIntoUserMessage prepends the relay notice and images to a user
+// message so relayed tool images share the next user turn instead of creating a
+// separate one.
+func mergeRelayImagesIntoUserMessage(message []byte, images [][]byte) []byte {
+	relayItems := make([][]byte, 0, len(images)+1)
+	noticeJSON := []byte(`{"type":"text","text":""}`)
+	noticeJSON, _ = sjson.SetBytes(noticeJSON, "text", toolResultImageRelayNotice)
+	relayItems = append(relayItems, noticeJSON)
+	relayItems = append(relayItems, images...)
+
+	content := gjson.GetBytes(message, "content")
+	if content.IsArray() {
+		contentItems := make([][]byte, 0, len(relayItems)+int(content.Get("#").Int()))
+		content.ForEach(func(_, item gjson.Result) bool {
+			contentItems = append(contentItems, []byte(item.Raw))
+			return true
+		})
+		return translatorcommon.SetRawArrayItems(message, "content", append(relayItems, contentItems...))
+	}
+	if content.Type == gjson.String && content.String() != "" {
+		textPart := []byte(`{"type":"text","text":""}`)
+		textPart, _ = sjson.SetBytes(textPart, "text", content.String())
+		relayItems = append(relayItems, textPart)
+	}
+	return translatorcommon.SetRawArrayItems(message, "content", relayItems)
 }
 
 func collectOpenAIResponsesReasoningContent(item gjson.Result) string {
